@@ -122,6 +122,7 @@ const DEFAULT_SETTINGS: CheckboxStyleSettings = {
  */
 const SCROLL_THRESHOLD = 10;      // Pixels of movement before canceling long-press
 const TAP_TIME_THRESHOLD = 300;   // Maximum duration for a tap vs. long-press
+const MOBILE_NATIVE_GESTURE_GUARD_RELEASE_DELAY = 1000; // Keep iOS callout suppressed after touchend
 
 /**
  * CODEMIRROR STATE EFFECTS
@@ -192,6 +193,84 @@ const throttle = <T extends (...args: any[]) => void>(func: T, delay: number): T
  */
 const getCheckboxMenuContainer = (target: HTMLElement): HTMLElement => {
     return target.closest('.cm-editor, .markdown-preview-view, .markdown-reading-view') as HTMLElement || document.body;
+};
+
+const getUniqueElements = (elements: Array<HTMLElement | null>): HTMLElement[] => {
+    const unique: HTMLElement[] = [];
+
+    elements.forEach(element => {
+        if (element && !unique.includes(element)) {
+            unique.push(element);
+        }
+    });
+
+    return unique;
+};
+
+/**
+ * Temporarily disables native mobile text selection/callout while long-pressing
+ * a checkbox. iOS can otherwise show the Copy/Look Up menu over this plugin's
+ * style menu before delayed preventDefault calls have any effect.
+ */
+class MobileNativeGestureGuard {
+    private readonly elements: HTMLElement[];
+    private readonly abortController = new AbortController();
+
+    constructor(target: HTMLElement) {
+        const line = target.closest('.cm-line, li.task-list-item, .task-list-item') as HTMLElement | null;
+        const container = getCheckboxMenuContainer(target);
+        this.elements = getUniqueElements([target, line, container]);
+
+        this.elements.forEach(element => {
+            element.classList.add('checkbox-style-menu-native-gesture-guard');
+        });
+
+        const { signal } = this.abortController;
+        document.addEventListener('selectstart', this.preventSelectionStart, { signal, capture: true });
+        document.addEventListener('selectionchange', this.clearSelection, { signal });
+        document.addEventListener('contextmenu', this.preventContextMenu, { signal, capture: true });
+
+        this.clearSelection();
+    }
+
+    clearSelection = () => {
+        const selection = window.getSelection?.();
+        if (selection && selection.rangeCount > 0) {
+            selection.removeAllRanges();
+        }
+    };
+
+    release() {
+        this.abortController.abort();
+        this.elements.forEach(element => {
+            element.classList.remove('checkbox-style-menu-native-gesture-guard');
+        });
+        this.clearSelection();
+    }
+
+    private containsEventTarget(eventTarget: EventTarget | null): boolean {
+        return eventTarget instanceof Node && this.elements.some(element => element.contains(eventTarget));
+    }
+
+    private preventSelectionStart = (event: Event) => {
+        if (!this.containsEventTarget(event.target)) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+    };
+
+    private preventContextMenu = (event: Event) => {
+        if (!this.containsEventTarget(event.target)) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+    };
+}
+
+const createMobileNativeGestureGuard = (target: HTMLElement): MobileNativeGestureGuard | null => {
+    return Platform.isMobile ? new MobileNativeGestureGuard(target) : null;
 };
 
 /**
@@ -990,6 +1069,8 @@ const pluginInstanceField = StateField.define<CheckboxStyleMenuPlugin | null>({
 class InteractionHandler {
     private state: WidgetState = { timer: null, lastTarget: null };
     private abortController: AbortController | null = null;
+    private mobileNativeGestureGuard: MobileNativeGestureGuard | null = null;
+    private longPressTriggered = false;
 
     constructor(private view: EditorView, private plugin: CheckboxStyleMenuPlugin) {
         this.setupEventListeners();
@@ -1010,6 +1091,7 @@ class InteractionHandler {
             this.view.dom.addEventListener('touchstart', this.handleTouchStart.bind(this), { signal, passive: false });
             this.view.dom.addEventListener('touchend', this.handleTouchEnd.bind(this), { signal, passive: false });
             this.view.dom.addEventListener('touchmove', this.handleTouchMove.bind(this), { signal, passive: false });
+            this.view.dom.addEventListener('touchcancel', this.handleTouchCancel.bind(this), { signal, passive: true });
         } else {
             this.view.dom.addEventListener('mousedown', this.handleMouseDown.bind(this), { signal });
             this.view.dom.addEventListener('mouseup', this.handleMouseUp.bind(this), { signal });
@@ -1020,6 +1102,7 @@ class InteractionHandler {
     /** Clean up event listeners when handler is destroyed */
     destroy() {
         this.clearTimer();
+        this.releaseMobileNativeGestureGuard();
         this.abortController?.abort();
         this.abortController = null;
     }
@@ -1032,6 +1115,24 @@ class InteractionHandler {
         }
     }
 
+    private startMobileNativeGestureGuard(target: HTMLElement) {
+        this.releaseMobileNativeGestureGuard();
+        this.mobileNativeGestureGuard = createMobileNativeGestureGuard(target);
+    }
+
+    private releaseMobileNativeGestureGuard(delay = 0) {
+        const guard = this.mobileNativeGestureGuard;
+        this.mobileNativeGestureGuard = null;
+
+        if (!guard) return;
+
+        if (delay > 0) {
+            setTimeout(() => guard.release(), delay);
+        } else {
+            guard.release();
+        }
+    }
+
     /**
      * Handles successful long-press detection
      * Delegates to the centralized menu trigger method
@@ -1039,6 +1140,9 @@ class InteractionHandler {
     private handleLongPress(target: HTMLElement) {
         const pos = this.view.posAtDOM(target);
         if (pos === null || pos < 0 || pos > this.view.state.doc.length) return;
+
+        this.longPressTriggered = true;
+        this.mobileNativeGestureGuard?.clearSelection();
 
         // Trigger with long-press method
         this.plugin.showCheckboxMenu(this.view, target, pos, 'long-press');
@@ -1122,6 +1226,8 @@ class InteractionHandler {
         if (isValidCheckboxTarget(target) && event.touches.length === 1) {
             const touch = event.touches[0];
             this.state.lastTarget = target;
+            this.longPressTriggered = false;
+            this.startMobileNativeGestureGuard(target);
             
             // Record initial touch data for gesture recognition
             this.state.touchStart = { 
@@ -1154,15 +1260,35 @@ class InteractionHandler {
             // If finger moved too far, this is a scroll gesture, not a long-press
             if (deltaX > SCROLL_THRESHOLD || deltaY > SCROLL_THRESHOLD) {
                 this.clearTimer();
+                this.releaseMobileNativeGestureGuard();
+                this.longPressTriggered = false;
                 this.state.lastTarget = null;
                 this.state.touchStart = undefined;
             }
         }
     }
 
-    private handleTouchEnd() {
+    private handleTouchEnd(event: TouchEvent) {
+        const wasLongPress = this.longPressTriggered;
+
+        if (wasLongPress) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+        }
+
         // Touch ended - cancel any pending long-press
         this.clearTimer();
+        this.state.lastTarget = null;
+        this.state.touchStart = undefined;
+        this.longPressTriggered = false;
+        this.releaseMobileNativeGestureGuard(wasLongPress ? MOBILE_NATIVE_GESTURE_GUARD_RELEASE_DELAY : 0);
+    }
+
+    private handleTouchCancel() {
+        this.clearTimer();
+        this.releaseMobileNativeGestureGuard();
+        this.longPressTriggered = false;
         this.state.lastTarget = null;
         this.state.touchStart = undefined;
     }
@@ -1176,6 +1302,8 @@ class InteractionHandler {
 class PreviewInteractionHandler extends MarkdownRenderChild {
     private state: WidgetState = { timer: null, lastTarget: null };
     private abortController: AbortController | null = null;
+    private mobileNativeGestureGuard: MobileNativeGestureGuard | null = null;
+    private longPressTriggered = false;
 
     constructor(
         containerEl: HTMLElement,
@@ -1192,6 +1320,7 @@ class PreviewInteractionHandler extends MarkdownRenderChild {
 
     onunload() {
         this.clearTimer();
+        this.releaseMobileNativeGestureGuard();
         this.abortController?.abort();
         this.abortController = null;
     }
@@ -1204,6 +1333,7 @@ class PreviewInteractionHandler extends MarkdownRenderChild {
             this.containerEl.addEventListener('touchstart', this.handleTouchStart.bind(this), { signal, passive: false });
             this.containerEl.addEventListener('touchend', this.handleTouchEnd.bind(this), { signal, passive: false });
             this.containerEl.addEventListener('touchmove', this.handleTouchMove.bind(this), { signal, passive: false });
+            this.containerEl.addEventListener('touchcancel', this.handleTouchCancel.bind(this), { signal, passive: true });
         } else {
             this.containerEl.addEventListener('mousedown', this.handleMouseDown.bind(this), { signal });
             this.containerEl.addEventListener('mouseup', this.handleMouseUp.bind(this), { signal });
@@ -1215,6 +1345,24 @@ class PreviewInteractionHandler extends MarkdownRenderChild {
         if (this.state.timer) {
             clearTimeout(this.state.timer);
             this.state.timer = null;
+        }
+    }
+
+    private startMobileNativeGestureGuard(target: HTMLElement) {
+        this.releaseMobileNativeGestureGuard();
+        this.mobileNativeGestureGuard = createMobileNativeGestureGuard(target);
+    }
+
+    private releaseMobileNativeGestureGuard(delay = 0) {
+        const guard = this.mobileNativeGestureGuard;
+        this.mobileNativeGestureGuard = null;
+
+        if (!guard) return;
+
+        if (delay > 0) {
+            setTimeout(() => guard.release(), delay);
+        } else {
+            guard.release();
         }
     }
 
@@ -1295,6 +1443,8 @@ class PreviewInteractionHandler extends MarkdownRenderChild {
     }
 
     private handleLongPress(target: HTMLElement) {
+        this.longPressTriggered = true;
+        this.mobileNativeGestureGuard?.clearSelection();
         this.showMenuForTarget(target, 'long-press');
     }
 
@@ -1345,6 +1495,8 @@ class PreviewInteractionHandler extends MarkdownRenderChild {
         if (target && event.touches.length === 1) {
             const touch = event.touches[0];
             this.state.lastTarget = target;
+            this.longPressTriggered = false;
+            this.startMobileNativeGestureGuard(target);
             this.state.touchStart = {
                 x: touch.clientX,
                 y: touch.clientY,
@@ -1369,14 +1521,34 @@ class PreviewInteractionHandler extends MarkdownRenderChild {
 
             if (deltaX > SCROLL_THRESHOLD || deltaY > SCROLL_THRESHOLD) {
                 this.clearTimer();
+                this.releaseMobileNativeGestureGuard();
+                this.longPressTriggered = false;
                 this.state.lastTarget = null;
                 this.state.touchStart = undefined;
             }
         }
     }
 
-    private handleTouchEnd() {
+    private handleTouchEnd(event: TouchEvent) {
+        const wasLongPress = this.longPressTriggered;
+
+        if (wasLongPress) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+        }
+
         this.clearTimer();
+        this.state.lastTarget = null;
+        this.state.touchStart = undefined;
+        this.longPressTriggered = false;
+        this.releaseMobileNativeGestureGuard(wasLongPress ? MOBILE_NATIVE_GESTURE_GUARD_RELEASE_DELAY : 0);
+    }
+
+    private handleTouchCancel() {
+        this.clearTimer();
+        this.releaseMobileNativeGestureGuard();
+        this.longPressTriggered = false;
         this.state.lastTarget = null;
         this.state.touchStart = undefined;
     }
